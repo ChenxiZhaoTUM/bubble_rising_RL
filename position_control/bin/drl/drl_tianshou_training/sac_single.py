@@ -220,7 +220,6 @@ def make_br_env(
         warmup_time=args.warmup_time,
         delta_time=args.delta_time,
         max_steps_per_episode=args.max_steps_per_episode,
-        obs_mode=args.obs_mode,
         n_probe_points=args.n_probe_points,
         action_amplitude=args.action_amplitude,
         mean_temperature=args.mean_temperature,

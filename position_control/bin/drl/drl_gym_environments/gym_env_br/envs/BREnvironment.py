@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+import csv
 import glob
 import argparse
 import importlib.util
@@ -10,7 +11,6 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from collections import deque
-
 
 # =============================================================================
 # Pybind module configuration.
@@ -129,6 +129,9 @@ def load_extension(path: str):
 
 
 def ensure_module():
+    if MODULE_NAME in sys.modules:
+        return sys.modules[MODULE_NAME]
+
     ext = locate_extension()
 
     if ext and os.path.exists(ext):
@@ -169,6 +172,147 @@ def _mkdir(p: str) -> str:
     return p
 
 
+# ------------------------------------------------------------------
+# CSV / metrics output helpers.
+# Keep these outside the Gym environment class.
+# ------------------------------------------------------------------
+BUBBLE_METRICS_FIELDS = [
+    "time",
+    "rl_step",
+    "number_of_iterations",
+
+    "center_x",
+    "center_y",
+    "center_u",
+    "center_v",
+
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+
+    "bubble_width",
+    "bubble_height",
+    "deformation_index",
+    "aspect_ratio",
+
+    "bubble_area",
+    "area_ratio",
+
+    "centroid_in_target",
+    "reached_target_height",
+
+    "left_particle_in_target",
+    "right_particle_in_target",
+    "bottom_particle_in_target",
+    "top_particle_in_target",
+
+    "all_extreme_particles_in_target",
+]
+
+
+def _episode_output_dir(training_root: str, parallel_envs: int, episode: int) -> str:
+    """
+    Return the same episode output folder used by the C++ IO environment.
+    Example:
+        training_root/output/output_env_0_episode_1
+    """
+    path = os.path.join(
+        os.path.abspath(training_root),
+        "output",
+        f"output_env_{parallel_envs}_episode_{episode}",
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _append_csv_row(path: str, fieldnames: list[str], row: dict, reset_file: bool = False):
+    """
+    Append one row to a CSV file.
+    If reset_file=True, remove the old file first.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if reset_file and os.path.exists(path):
+        os.remove(path)
+
+    file_exists = os.path.exists(path)
+
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+        if not file_exists or os.path.getsize(path) == 0:
+            writer.writeheader()
+
+        writer.writerow(row)
+
+
+def _write_bubble_metrics_csv(
+    output_dir: str,
+    time_value: float,
+    rl_step: int,
+    number_of_iterations: int,
+    metrics: dict,
+    reset_file: bool = False,
+):
+    """
+    Write pure physical bubble metrics to:
+        output_dir/bubble_control_metrics.csv
+
+    This file deliberately excludes:
+        reward,
+        action,
+        seg_temps,
+        progress_norm,
+        height_progress,
+        penalties,
+        bubble_broken.
+    """
+    row = {
+        "time": float(time_value),
+        "rl_step": int(rl_step),
+        "number_of_iterations": int(number_of_iterations),
+
+        "center_x": float(metrics["center_x"]),
+        "center_y": float(metrics["center_y"]),
+        "center_u": float(metrics["center_u"]),
+        "center_v": float(metrics["center_v"]),
+
+        "x_min": float(metrics["x_min"]),
+        "x_max": float(metrics["x_max"]),
+        "y_min": float(metrics["y_min"]),
+        "y_max": float(metrics["y_max"]),
+
+        "bubble_width": float(metrics["bubble_width"]),
+        "bubble_height": float(metrics["bubble_height"]),
+        "deformation_index": float(metrics["deformation_index"]),
+        "aspect_ratio": float(metrics["aspect_ratio"]),
+
+        "bubble_area": float(metrics["bubble_area"]),
+        "area_ratio": float(metrics["area_ratio"]),
+
+        "centroid_in_target": int(metrics["centroid_in_target"]),
+        "reached_target_height": int(metrics["reached_target_height"]),
+
+        "left_particle_in_target": int(metrics["left_particle_in_target"]),
+        "right_particle_in_target": int(metrics["right_particle_in_target"]),
+        "bottom_particle_in_target": int(metrics["bottom_particle_in_target"]),
+        "top_particle_in_target": int(metrics["top_particle_in_target"]),
+
+        "all_extreme_particles_in_target": int(
+            metrics["all_extreme_particles_in_target"]
+        ),
+    }
+
+    path = os.path.join(output_dir, "bubble_control_metrics.csv")
+
+    _append_csv_row(
+        path=path,
+        fieldnames=BUBBLE_METRICS_FIELDS,
+        row=row,
+        reset_file=reset_file,
+    )
+
 # =============================================================================
 # Single-agent bubble rising position-control environment.
 # =============================================================================
@@ -191,8 +335,6 @@ class BubbleRisingPositionEnv(gym.Env):
             area ratio,
             deformation index,
             target-region flags.
-
-    Bubble metrics are NOT part of the agent observation.
     """
 
     metadata = {}
@@ -208,7 +350,6 @@ class BubbleRisingPositionEnv(gym.Env):
         warmup_time: float = 0.0,
         delta_time: float = 0.02,
         max_steps_per_episode: int = 250,
-        obs_mode: str = "flow",
         n_probe_points: int = 400,
         action_amplitude: float = 0.3,
         mean_temperature: float = 1.0,
@@ -230,9 +371,6 @@ class BubbleRisingPositionEnv(gym.Env):
         self.max_steps_per_episode = int(max_steps_per_episode)
         self.max_steps_per_episode_eval = 4 * self.max_steps_per_episode
         self.deterministic = False
-
-        # Force flow-only observation.
-        self.obs_mode = "flow"
 
         self.n_probe_points = int(n_probe_points)
         self.flow_obs_len = 3 * self.n_probe_points
@@ -449,9 +587,7 @@ class BubbleRisingPositionEnv(gym.Env):
     # ------------------------------------------------------------------
     # Reward: computed only from bubble metrics.
     # ------------------------------------------------------------------
-    def _compute_reward(self, action: np.ndarray) -> tuple[float, dict]:
-        metrics = self.sim.get_bubble_metrics_dict()
-
+    def _compute_reward(self, action: np.ndarray, metrics: dict) -> tuple[float, dict]:
         center_x = float(metrics["center_x"])
         center_y = float(metrics["center_y"])
         center_u = float(metrics["center_u"])
@@ -714,6 +850,21 @@ class BubbleRisingPositionEnv(gym.Env):
         # --------------------------------------------------------------
         metrics0 = self.sim.get_bubble_metrics_dict()
 
+        output_dir = _episode_output_dir(
+            self.training_root,
+            self.parallel_envs,
+            self.episode,
+        )
+
+        _write_bubble_metrics_csv(
+            output_dir=output_dir,
+            time_value=self.sim_time,
+            rl_step=0,
+            number_of_iterations=self.sim.get_number_of_iterations(),
+            metrics=metrics0,
+            reset_file=True,
+        )
+
         self.ref_center_y = float(metrics0["center_y"])
         self.prev_center_y = float(metrics0["center_y"])
 
@@ -731,7 +882,7 @@ class BubbleRisingPositionEnv(gym.Env):
 
         self.last_reset_info = {
             "episode": self.episode,
-            "physical_time": float(self.sim.get_physical_time()),
+            "physical_time": self.sim_time,
             "metrics": metrics0,
             "ref_center_y": self.ref_center_y,
             "ref_area_ratio": self.ref_area_ratio,
@@ -753,15 +904,31 @@ class BubbleRisingPositionEnv(gym.Env):
 
         end_time = self.sim_time + self.delta_time
         self.sim.run_case(end_time)
-
         self.step_count += 1
-        self.sim_time = end_time
+        self.sim_time = float(self.sim.get_physical_time())
+
+        output_dir = _episode_output_dir(
+            self.training_root,
+            self.parallel_envs,
+            self.episode,
+        )
+
+        metrics = self.sim.get_bubble_metrics_dict()
+
+        _write_bubble_metrics_csv(
+            output_dir=output_dir,
+            time_value=self.sim_time,
+            rl_step=self.step_count,
+            number_of_iterations=self.sim.get_number_of_iterations(),
+            metrics=metrics,
+            reset_file=False,
+        )
 
         # Observation: flow field only.
         obs = self._read_observation()
 
         # Reward: bubble metrics only.
-        reward, info = self._compute_reward(action)
+        reward, info = self._compute_reward(action, metrics)
         self.total_reward_per_episode += reward
 
         self._log_step(action, seg_temps, reward, info)
@@ -825,7 +992,6 @@ def _smoke_test():
         warmup_time=0.0,
         delta_time=0.02,
         max_steps_per_episode=10,
-        obs_mode="flow",
         n_probe_points=400,
     )
 

@@ -6,8 +6,11 @@
       <excludeFolder url="file://$MODULE_DIR$/position_control/bin/bind/output_env_0_episode_0" />
       <excludeFolder url="file://$MODULE_DIR$/position_control/bin/bind/pybind_test" />
       <excludeFolder url="file://$MODULE_DIR$/position_control/bin/drl/training_process" />
+      <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/.venv1" />
+      <excludeFolder url="file://$MODULE_DIR$/position_control/training_process" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.10 (bubble_rising_RL)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Python 3.11 (bubble_rising_RL)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
   <component name="PyDocumentationSettings">
