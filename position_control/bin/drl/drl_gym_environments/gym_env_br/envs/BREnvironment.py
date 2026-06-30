@@ -215,11 +215,10 @@ def _episode_output_dir(training_root: str, parallel_envs: int, episode: int) ->
     """
     Return the same episode output folder used by the C++ IO environment.
     Example:
-        training_root/output/output_env_0_episode_1
+        training_root/output_env_0_episode_1
     """
     path = os.path.join(
         os.path.abspath(training_root),
-        "output",
         f"output_env_{parallel_envs}_episode_{episode}",
     )
     os.makedirs(path, exist_ok=True)
@@ -353,6 +352,9 @@ class BubbleRisingPositionEnv(gym.Env):
         n_probe_points: int = 400,
         action_amplitude: float = 0.3,
         mean_temperature: float = 1.0,
+        use_first_episode_as_baseline: bool = True,
+        baseline_parallel_env: int | None = None,
+        passive_target_time: float = 0.835632,
     ):
         super().__init__()
 
@@ -440,39 +442,49 @@ class BubbleRisingPositionEnv(gym.Env):
         self._obs_hist = deque(maxlen=4)
 
         # ------------------------------------------------------------------
-        # Bounded reward weights.
-        # Per-step reward is kept O(1), avoiding -1000 episode returns.
+        # Reward weights.
+        # Objective:
+        #   1. Episode 1 of env0 is a passive no-control baseline.
+        #   2. The passive baseline should receive reward exactly 0.
+        #   3. Later controlled episodes are rewarded only for doing better
+        #      than the passive baseline: faster entry, better holding near the
+        #      target center, lower velocity, smaller deformation/area error,
+        #      and less time outside the target rectangle.
         # ------------------------------------------------------------------
-        self.w_alive = 0.05
 
-        # Before reaching target height.
-        self.w_rise_progress = 0.6
-        self.w_height_progress = 0.4
-        self.w_time = 0.005
-        self.w_enter_bonus = 2.0
+        # Baseline control.
+        # By default, every environment uses its own episode 1 as a passive
+        # baseline. Set baseline_parallel_env=0 if only env0 should do this.
+        self.use_first_episode_as_baseline = bool(use_first_episode_as_baseline)
+        self.baseline_parallel_env = baseline_parallel_env
+        self.passive_target_time = float(passive_target_time)
 
-        # After reaching target height.
-        self.w_inside_target = 1.0
-        self.w_whole_inside_target = 0.5
-        self.w_outside_distance = 0.5
-        self.w_velocity_hold = 0.10
+        # Entry reward: only rewards faster-than-passive arrival at target height.
+        self.w_fast_entry = 4.0
 
-        # Bubble integrity.
-        self.w_area = 1.0
-        self.w_deform = 1.5
-        self.w_break = 5.0
+        # Holding reward: positive only when the bubble is close to the target
+        # center and slow. The passive trajectory passes through the target, but
+        # it should not earn high reward just for natural rising.
+        self.w_hold = 1.0
+        self.center_radius_for_hold = 0.45
+        self.speed_norm_for_hold = 0.18
 
-        # Control regularization.
-        self.w_action = 0.02
-        self.w_smooth = 0.05
+        # Penalties/improvements relative to passive baseline.
+        self.w_outside_target = 1.0
+        self.w_velocity = 0.4
+        self.w_area = 0.6
+        self.w_deform = 1.2
 
-        # Soft / hard limits.
-        self.deformation_soft = 0.55
-        self.deformation_hard = 0.90
+        # Absolute control regularization.
+        self.w_action = 0.01
+        self.w_smooth = 0.02
 
-        # Area is judged relative to reset-time area ratio.
-        self.area_soft = 0.25
-        self.area_hard = 0.65
+        # Strong penalty once the bubble is judged broken.
+        self.w_break = 8.0
+
+        # Break thresholds. These are used for termination.
+        self.deformation_break = 0.60
+        self.area_break = 0.35
 
         # ------------------------------------------------------------------
         # Runtime state.
@@ -499,6 +511,11 @@ class BubbleRisingPositionEnv(gym.Env):
         self.ref_area_ratio = 1.0
 
         self.last_reset_info = {}
+
+        # Passive baseline recorded from env0 episode 1.
+        self.current_episode_is_baseline = False
+        self.baseline_metrics_by_step: list[dict] = []
+        self.baseline_entry_time: float | None = None
 
     # ------------------------------------------------------------------
     # Action handling.
@@ -559,19 +576,13 @@ class BubbleRisingPositionEnv(gym.Env):
     def _ramp01(x: float) -> float:
         return float(np.clip(x, 0.0, 1.0))
 
-    @staticmethod
-    def _soft_excess(value: float, soft: float, hard: float) -> float:
-        """
-        Returns 0 below soft limit and 1 above hard limit.
-        """
-        if hard <= soft:
-            return float(value > hard)
-
-        return float(np.clip((value - soft) / (hard - soft), 0.0, 1.0))
-
     def _target_distance_penalty(self, center_x: float, center_y: float) -> float:
         """
-        Bounded target-distance penalty in [0, 1].
+        Bounded target-center penalty in [0, 1].
+
+        0 means the bubble center is exactly at the target center.
+        Values near the target boundary are approximately 0.5 to 0.7.
+        Far-away states are capped at 1.
         """
         half_w = 0.5 * (self.target_x_max - self.target_x_min)
         half_h = 0.5 * (self.target_y_max - self.target_y_min)
@@ -580,9 +591,80 @@ class BubbleRisingPositionEnv(gym.Env):
         dy = (center_y - self.target_y_center) / (half_h + 1.0e-12)
 
         dist = float(np.sqrt(dx * dx + dy * dy))
-
-        # 0 at target center, roughly 1 near target boundary.
         return float(np.clip(dist, 0.0, 2.0) / 2.0)
+
+    def _outside_target_penalty(self, center_x: float, center_y: float) -> float:
+        """
+        Bounded outside-target penalty in [0, 1].
+
+        0 means the bubble center is inside the target rectangle.
+        It increases smoothly once the center leaves the rectangle.
+        """
+        half_w = 0.5 * (self.target_x_max - self.target_x_min)
+        half_h = 0.5 * (self.target_y_max - self.target_y_min)
+
+        ox = max(self.target_x_min - center_x, 0.0, center_x - self.target_x_max)
+        oy = max(self.target_y_min - center_y, 0.0, center_y - self.target_y_max)
+
+        ox /= half_w + 1.0e-12
+        oy /= half_h + 1.0e-12
+
+        return float(np.clip(np.sqrt(ox * ox + oy * oy), 0.0, 1.0))
+
+    def _target_center_distance_raw(self, center_x: float, center_y: float) -> float:
+        """
+        Normalized distance from the target center.
+
+        0 means exactly at target center. A value near 1 means near the target
+        rectangle boundary along x or y.
+        """
+        half_w = 0.5 * (self.target_x_max - self.target_x_min)
+        half_h = 0.5 * (self.target_y_max - self.target_y_min)
+
+        dx = (center_x - self.target_x_center) / (half_w + 1.0e-12)
+        dy = (center_y - self.target_y_center) / (half_h + 1.0e-12)
+
+        return float(np.sqrt(dx * dx + dy * dy))
+
+    def _hold_score(
+        self,
+        center_x: float,
+        center_y: float,
+        center_u: float,
+        center_v: float,
+    ) -> tuple[float, float, float, float, float]:
+        """
+        Holding score in [0, 1].
+
+        A high score requires both:
+            1. center close to target center,
+            2. small centroid velocity.
+
+        Natural passive rising usually passes through the target, but its speed
+        is not small, so this score prevents passive crossing from receiving
+        a large positive reward.
+        """
+        center_dist = self._target_center_distance_raw(center_x, center_y)
+        speed_norm = float(
+            np.sqrt(center_u * center_u + center_v * center_v)
+            / (self.U_f + 1.0e-12)
+        )
+
+        center_score = float(
+            np.clip(1.0 - center_dist / (self.center_radius_for_hold + 1.0e-12), 0.0, 1.0)
+        )
+        speed_score = float(
+            np.clip(1.0 - speed_norm / (self.speed_norm_for_hold + 1.0e-12), 0.0, 1.0)
+        )
+        hold_score = center_score * speed_score
+
+        return hold_score, center_dist, speed_norm, center_score, speed_score
+
+    def _baseline_metrics_for_step(self, step_count: int) -> dict | None:
+        idx = int(step_count) - 1
+        if 0 <= idx < len(self.baseline_metrics_by_step):
+            return self.baseline_metrics_by_step[idx]
+        return None
 
     # ------------------------------------------------------------------
     # Reward: computed only from bubble metrics.
@@ -600,43 +682,39 @@ class BubbleRisingPositionEnv(gym.Env):
         reached_target_height = int(metrics["reached_target_height"])
         all_extreme_in_target = int(metrics["all_extreme_particles_in_target"])
 
-        # ------------------------------------------------------------------
-        # Relative area error based on reset value.
-        # This avoids large reward offsets if C++ area_ratio is not exactly 1.0.
-        # ------------------------------------------------------------------
+        # Area error relative to reset-time value.
         area_rel = area_ratio_raw / (self.ref_area_ratio + 1.0e-12)
         area_error = abs(area_rel - 1.0)
 
-        deformation_excess = self._soft_excess(
-            deformation_index,
-            self.deformation_soft,
-            self.deformation_hard,
-        )
+        deformation_break = bool(deformation_index >= self.deformation_break)
+        area_break = bool(area_error >= self.area_break)
+        bubble_broken = bool(deformation_break or area_break)
 
-        area_excess = self._soft_excess(
-            area_error,
-            self.area_soft,
-            self.area_hard,
-        )
-
-        bubble_broken = bool(
-            deformation_index >= self.deformation_hard
-            or area_error >= self.area_hard
-        )
-
-        # ------------------------------------------------------------------
-        # Reward components.
-        # ------------------------------------------------------------------
-        reward = 0.0
-        reward += self.w_alive
-
+        # Stage transition. Only the first time reaching target height can get
+        # an entry reward; passive baseline receives exactly zero reward.
         enter_bonus = 0.0
+        entry_time_gain = 0.0
 
         if reached_target_height and not self.has_entered_target_height:
             self.has_entered_target_height = True
-            enter_bonus = self.w_enter_bonus
 
-        # Vertical progress normalized by expected velocity scale.
+            if not self.current_episode_is_baseline:
+                ref_entry_time = (
+                    self.baseline_entry_time
+                    if self.baseline_entry_time is not None
+                    else self.passive_target_time
+                )
+                entry_time_gain = float(
+                    np.clip(
+                        (ref_entry_time - self.sim_time) / (ref_entry_time + 1.0e-12),
+                        -1.0,
+                        1.0,
+                    )
+                )
+                enter_bonus = self.w_fast_entry * entry_time_gain
+
+        # Vertical progress is diagnostic only. It is not rewarded directly,
+        # because passive rising would otherwise receive high reward.
         dy_step = center_y - self.prev_center_y
         progress_norm = float(
             np.clip(
@@ -646,7 +724,6 @@ class BubbleRisingPositionEnv(gym.Env):
             )
         )
 
-        # Progress from reset height to target lower boundary.
         height_denom = self.target_y_min - self.ref_center_y
         if abs(height_denom) < 1.0e-12:
             height_progress = 1.0
@@ -655,54 +732,104 @@ class BubbleRisingPositionEnv(gym.Env):
                 (center_y - self.ref_center_y) / height_denom
             )
 
-        if not self.has_entered_target_height:
-            # Stage 1: move upward quickly to y = DH / 3.
-            reward += self.w_rise_progress * progress_norm
-            reward += self.w_height_progress * height_progress
-            reward -= self.w_time
+        outside_target_penalty = self._outside_target_penalty(center_x, center_y)
+        hold_score, center_dist, speed_norm, center_score, speed_score = self._hold_score(
+            center_x, center_y, center_u, center_v
+        )
+        speed_norm2 = speed_norm * speed_norm
+
+        # Baseline diagnostics/defaults.
+        baseline_metrics = self._baseline_metrics_for_step(self.step_count)
+        baseline_available = baseline_metrics is not None
+
+        baseline_hold_score = 0.0
+        baseline_center_dist = 0.0
+        baseline_speed_norm = 0.0
+        baseline_speed_norm2 = 0.0
+        baseline_outside_penalty = 0.0
+        baseline_area_error = 0.0
+        baseline_deformation = 0.0
+
+        if baseline_metrics is not None:
+            baseline_area_rel = float(baseline_metrics["area_ratio"]) / (self.ref_area_ratio + 1.0e-12)
+            baseline_area_error = abs(baseline_area_rel - 1.0)
+            baseline_deformation = float(baseline_metrics["deformation_index"])
+            baseline_outside_penalty = self._outside_target_penalty(
+                float(baseline_metrics["center_x"]),
+                float(baseline_metrics["center_y"]),
+            )
+            (
+                baseline_hold_score,
+                baseline_center_dist,
+                baseline_speed_norm,
+                _,
+                _,
+            ) = self._hold_score(
+                float(baseline_metrics["center_x"]),
+                float(baseline_metrics["center_y"]),
+                float(baseline_metrics["center_u"]),
+                float(baseline_metrics["center_v"]),
+            )
+            baseline_speed_norm2 = baseline_speed_norm * baseline_speed_norm
+
+        # --------------------------------------------------------------
+        # Reward.
+        # --------------------------------------------------------------
+        if self.current_episode_is_baseline:
+            # Episode 1 is a pure calibration/passive baseline. It is forced to
+            # zero action in step(), and its reward is exactly zero so that the
+            # baseline total reward is 0 by definition.
+            reward = 0.0
+            hold_reward = 0.0
+            outside_reward = 0.0
+            velocity_reward = 0.0
+            area_reward = 0.0
+            deform_reward = 0.0
+            action_cost = 0.0
+            smooth_cost = 0.0
 
         else:
-            # Stage 2: stay inside target region.
-            if centroid_in_target:
-                reward += self.w_inside_target
-            else:
-                dist_penalty = self._target_distance_penalty(center_x, center_y)
-                reward -= self.w_outside_distance * dist_penalty
+            reward = 0.0
 
-            if all_extreme_in_target:
-                reward += self.w_whole_inside_target
+            # Faster-than-passive entry. Passive entry gives 0. Slower entry is
+            # negative; faster entry is positive.
+            reward += enter_bonus
 
-            # Once target height is reached, slow motion is preferred.
-            speed_norm2 = (
-                center_u * center_u + center_v * center_v
-            ) / (self.U_f * self.U_f + 1.0e-12)
+            # Holding quality relative to passive trajectory at the same step.
+            # If the controlled trajectory is not better than passive, this term
+            # is near zero or negative.
+            hold_reward = self.w_hold * (hold_score - baseline_hold_score)
+            reward += hold_reward
 
-            reward -= self.w_velocity_hold * float(np.clip(speed_norm2, 0.0, 4.0))
+            # Leaving the target rectangle is judged relative to passive. If the
+            # controlled bubble stays in the target while passive has left, this
+            # becomes positive. If it leaves earlier/farther, it becomes negative.
+            outside_reward = self.w_outside_target * (
+                baseline_outside_penalty - outside_target_penalty
+            )
+            reward += outside_reward
 
-        reward += enter_bonus
+            # Prefer smaller velocity than passive after target height is reached.
+            # Before target height, this term is weak because the main objective
+            # is fast entry.
+            velocity_weight = self.w_velocity if self.has_entered_target_height else 0.25 * self.w_velocity
+            velocity_reward = velocity_weight * (baseline_speed_norm2 - speed_norm2)
+            reward += velocity_reward
 
-        # ------------------------------------------------------------------
-        # Bubble integrity penalties, bounded.
-        # ------------------------------------------------------------------
-        area_penalty = self.w_area * area_excess
-        deform_penalty = self.w_deform * deformation_excess
+            # Prefer smaller area error and deformation than passive.
+            area_reward = self.w_area * (baseline_area_error - area_error)
+            deform_reward = self.w_deform * (baseline_deformation - deformation_index)
+            reward += area_reward
+            reward += deform_reward
 
-        reward -= area_penalty
-        reward -= deform_penalty
+            action_cost = self.w_action * float(np.mean(action * action))
+            smooth_cost = self.w_smooth * float(np.mean((action - self.last_action) ** 2))
+            reward -= action_cost
+            reward -= smooth_cost
 
-        if bubble_broken:
-            reward -= self.w_break
+            if bubble_broken:
+                reward -= self.w_break
 
-        # ------------------------------------------------------------------
-        # Control cost.
-        # ------------------------------------------------------------------
-        action_cost = self.w_action * float(np.mean(action * action))
-        smooth_cost = self.w_smooth * float(np.mean((action - self.last_action) ** 2))
-
-        reward -= action_cost
-        reward -= smooth_cost
-
-        # Update previous position after using it.
         self.prev_center_y = center_y
 
         info = {
@@ -719,17 +846,47 @@ class BubbleRisingPositionEnv(gym.Env):
             "centroid_in_target": centroid_in_target,
             "reached_target_height": reached_target_height,
             "all_extreme_particles_in_target": all_extreme_in_target,
+
+            "deformation_break": deformation_break,
+            "area_break": area_break,
             "bubble_broken": bubble_broken,
 
             "progress_norm": progress_norm,
             "height_progress": height_progress,
             "enter_bonus": enter_bonus,
+            "entry_time_gain": entry_time_gain,
 
-            "area_penalty": area_penalty,
-            "deform_penalty": deform_penalty,
+            "outside_target_penalty": outside_target_penalty,
+            "hold_score": hold_score,
+            "center_dist": center_dist,
+            "center_score": center_score,
+            "speed_score": speed_score,
+            "speed_norm": speed_norm,
+            "speed_norm2": speed_norm2,
+
+            "baseline_available": baseline_available,
+            "baseline_hold_score": baseline_hold_score,
+            "baseline_center_dist": baseline_center_dist,
+            "baseline_speed_norm": baseline_speed_norm,
+            "baseline_outside_penalty": baseline_outside_penalty,
+            "baseline_area_error": baseline_area_error,
+            "baseline_deformation": baseline_deformation,
+
+            "hold_reward": hold_reward,
+            "outside_reward": outside_reward,
+            "velocity_reward": velocity_reward,
+            "area_reward": area_reward,
+            "deform_reward": deform_reward,
             "action_cost": action_cost,
             "smooth_cost": smooth_cost,
 
+            # Backward-compatible fields used by old log analysis.
+            "target_center_penalty": float(np.clip(center_dist, 0.0, 2.0) / 2.0),
+            "target_center_score": float(np.clip(1.0 - center_dist, 0.0, 1.0)),
+            "area_penalty": -area_reward,
+            "deform_penalty": -deform_reward,
+
+            "baseline_episode": self.current_episode_is_baseline,
             "raw_reward": float(reward),
         }
 
@@ -793,6 +950,8 @@ class BubbleRisingPositionEnv(gym.Env):
                 f"area_error: {info['area_error']:.6f} "
                 f"progress: {info['progress_norm']:.6f} "
                 f"height_progress: {info['height_progress']:.6f} "
+                f"deformation_break: {info.get('deformation_break', False)} "
+                f"area_break: {info.get('area_break', False)} "
                 f"broken: {info['bubble_broken']} "
                 f"raw_reward: {info['raw_reward']:.6f}\n"
             )
@@ -814,6 +973,15 @@ class BubbleRisingPositionEnv(gym.Env):
     # ------------------------------------------------------------------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+
+        self.current_episode_is_baseline = bool(
+            self.use_first_episode_as_baseline
+            and self.episode == 1
+            and (
+                self.baseline_parallel_env is None
+                or self.parallel_envs == self.baseline_parallel_env
+            )
+        )
 
         self._open_episode_logs()
 
@@ -838,6 +1006,10 @@ class BubbleRisingPositionEnv(gym.Env):
         self.total_reward_per_episode = 0.0
         self.has_entered_target_height = False
         self.last_action = np.zeros(self.n_seg, dtype=np.float32)
+
+        if self.current_episode_is_baseline:
+            self.baseline_metrics_by_step = []
+            self.baseline_entry_time = None
 
         self._obs_hist.clear()
 
@@ -889,6 +1061,7 @@ class BubbleRisingPositionEnv(gym.Env):
             "left_wall_segment_temperatures": list(
                 self.sim.get_left_wall_segment_temperatures()
             ),
+            "baseline_episode": self.current_episode_is_baseline,
         }
 
         # Keep reset info empty for Tianshou compatibility.
@@ -898,9 +1071,16 @@ class BubbleRisingPositionEnv(gym.Env):
     # Gym API: step.
     # ------------------------------------------------------------------
     def step(self, action):
-        action = self._sanitize_action(action)
+        policy_action = self._sanitize_action(action)
 
-        seg_temps = self._send_action_to_cpp(action)
+        # Episode 1 is the passive no-control baseline. Ignore whatever
+        # action Tianshou provides and apply zero action to the C++ solver.
+        if self.current_episode_is_baseline:
+            applied_action = np.zeros(self.n_seg, dtype=np.float32)
+        else:
+            applied_action = policy_action
+
+        seg_temps = self._send_action_to_cpp(applied_action)
 
         end_time = self.sim_time + self.delta_time
         self.sim.run_case(end_time)
@@ -924,14 +1104,21 @@ class BubbleRisingPositionEnv(gym.Env):
             reset_file=False,
         )
 
+        if self.current_episode_is_baseline:
+            # Store the passive trajectory for later controlled episodes.
+            self.baseline_metrics_by_step.append(dict(metrics))
+            if self.baseline_entry_time is None and int(metrics["reached_target_height"]):
+                self.baseline_entry_time = float(self.sim_time)
+
         # Observation: flow field only.
         obs = self._read_observation()
 
-        # Reward: bubble metrics only.
-        reward, info = self._compute_reward(action, metrics)
+        # Reward: bubble metrics only. Use applied_action because that is the
+        # actual action sent to C++.
+        reward, info = self._compute_reward(applied_action, metrics)
         self.total_reward_per_episode += reward
 
-        self._log_step(action, seg_temps, reward, info)
+        self._log_step(applied_action, seg_temps, reward, info)
 
         terminated = bool(info["bubble_broken"])
 
@@ -950,6 +1137,10 @@ class BubbleRisingPositionEnv(gym.Env):
                 "physical_time": float(self.sim.get_physical_time()),
                 "segment_temperatures": seg_temps,
                 "total_reward": self.total_reward_per_episode,
+                "baseline_episode": self.current_episode_is_baseline,
+                "policy_action": policy_action.copy(),
+                "applied_action": applied_action.copy(),
+                "baseline_entry_time": self.baseline_entry_time,
             }
         )
 
@@ -957,7 +1148,7 @@ class BubbleRisingPositionEnv(gym.Env):
             self._log_episode_end()
             self.episode += 1
 
-        self.last_action = action.copy()
+        self.last_action = applied_action.copy()
 
         return obs, float(reward), terminated, truncated, info
 
