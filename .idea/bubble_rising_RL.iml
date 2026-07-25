@@ -10,7 +10,7 @@
       <excludeFolder url="file://$MODULE_DIR$/.venv1" />
       <excludeFolder url="file://$MODULE_DIR$/position_control/training_process" />
       <excludeFolder url="file://$MODULE_DIR$/velocity_control/bin/bind/pybind_test_bottom" />
-      <excludeFolder url="file://$MODULE_DIR$/velocity_control/bin/drl/drl_tianshou_training" />
+      <excludeFolder url="file://$MODULE_DIR$/velocity_control/training_process" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.11 (bubble_rising_RL)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

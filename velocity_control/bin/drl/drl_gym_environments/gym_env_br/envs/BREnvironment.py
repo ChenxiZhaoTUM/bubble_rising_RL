@@ -458,13 +458,13 @@ class BubbleRisingPositionEnv(gym.Env):
         # Keep this reward intentionally simple for the single target.
         # ------------------------------------------------------------------
         self.w_time = 0.02
-        self.w_height_advantage = 20.0
-        self.w_vertical_velocity_advantage = 3.0
+        self.w_height_advantage = 5.0
+        self.w_vertical_velocity_advantage = 0.0
 
         # If a controlled episode reaches the target earlier by 0.04 s, this
         # contributes roughly +4 reward.
-        self.w_fast_time = 100.0
-        self.w_success = 5.0
+        self.w_fast_time = 200.0
+        self.w_success = 10.0
 
         # Very small action regularization. Do not suppress control authority.
         self.w_action = 0.001
